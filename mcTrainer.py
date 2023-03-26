@@ -1,88 +1,91 @@
-import numpy as np
-import math
+import tqdm
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 
-# Define the RNN architecture
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 class RNN(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
         super(RNN, self).__init__()
-        self.hidden_size = hidden_size
         self.rnn = nn.RNN(input_size, hidden_size, batch_first=True)
         self.fc = nn.Linear(hidden_size, output_size)
-        
-    def forward(self, x):
-        out, hidden = self.rnn(x)
-        out = self.fc(out[:, -1, :])
-        return out
+        self.to(DEVICE)
 
-# Define the Markov chain class
+    def forward(self, x):
+        x, _ = self.rnn(x)
+        x = self.fc(x[:, -1, :])
+        return x
+
 class MarkovChain:
     def __init__(self, rnn, data):
-        self.rnn = rnn
+        self.model = rnn
         self.data = data
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def train(self, lr=0.001, epochs=100, batch_size=32):
-        # Prepare the data
-        seq_len = self.rnn.rnn.num_layers
-        X = []
-        Y = []
-        for i in range(len(self.data) - seq_len):
-            X.append(torch.tensor(self.data[i:i+seq_len]).float().unsqueeze(0))
-            Y.append(torch.tensor(self.data[i+seq_len]).float().unsqueeze(0))
-        X = torch.cat(X, dim=0)
-        Y = torch.cat(Y, dim=0)
+    def prepare_data(self, data, window_size):
+        x, y = [], []
+        for i in range(len(data) - window_size):
+            x.append(data[i:i + window_size])
+            y.append(data[i + window_size])
+        return torch.tensor(x).float(), torch.tensor(y).float()
+                    
+    def train(self, window_size, epochs, batch_size, learning_rate, show_progress=True):
+        x, y = self.prepare_data(self.data, window_size)
+        dataset = TensorDataset(x, y)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        criterion = nn.L1Loss()
+        optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
 
-        # Move the data to the device
-        X = X.to(self.device)
-        Y = Y.to(self.device)
+        self.model.train()
 
-        # Instantiate the ADAM optimizer and the MSE loss function
-        optimizer = optim.Adam(self.rnn.parameters(), lr=lr)
-        criterion = nn.MSELoss()
+        total_steps = len(dataloader) * epochs
+        progress_bar = tqdm.tqdm(total=total_steps, desc="Training Progress") if show_progress else None
 
-        # Train the model
         for epoch in range(epochs):
-            self.rnn.train()
-            for i in range(0, len(X), batch_size):
+            for inputs, targets in dataloader:
+                inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
+                inputs = inputs.unsqueeze(-1)
                 optimizer.zero_grad()
-                batch_x = X[i:i+batch_size].view(-1, seq_len, 1)  # reshape the input tensor
-                batch_y = Y[i:i+batch_size]
-                output = self.rnn(batch_x)
-                loss = criterion(output.squeeze(), Y[i:i+batch_size])
+                outputs = self.model(inputs)
+                loss = criterion(outputs, targets.unsqueeze(-1))
                 loss.backward()
                 optimizer.step()
-            if epoch % 10 == 0:
-                print("Epoch [{}/{}], Loss: {:.4f}".format(epoch+1, epochs, loss.item()))
 
-    def predict(self, x, n_steps=1):
-        self.rnn.eval()
-        x_test = torch.tensor(x).float().unsqueeze(0).unsqueeze(2)
-        x_test = x_test.to(self.device)
+                if show_progress:
+                    progress_bar.update(1)
+
+        if show_progress:
+            progress_bar.close()
+
+    def forecast(self, data, window_size, n_steps):
+        self.model.eval()
         with torch.no_grad():
-            y_pred = []
-            for i in range(n_steps):
-                output = self.rnn(x_test)
-                y_pred.append(math.ceil(output.item()))
-                x_test = torch.cat([x_test[:, 1:, :], output.unsqueeze(2)], dim=1)
-        return y_pred
-    
+            predictions = []
+            for _ in range(n_steps):
+                inputs = torch.tensor(data[-window_size:]).float().to(DEVICE)
+                inputs = inputs.unsqueeze(0).unsqueeze(-1)
+                output = self.model(inputs)
+                prediction = output.item()
+                predictions.append(prediction)
+                data.append(prediction)
+            return predictions
+        
     def score(self, plot=False):
         # Make predictions
-        y_true = torch.tensor(self.data[self.rnn.rnn.num_layers:]).to(self.device)
+        y_true = torch.tensor(self.data[self.model.rnn.num_layers:]).to(DEVICE)
         y_pred = []
         mape_batch = []
-        for i in range(0, len(self.data) - self.rnn.rnn.num_layers, 7):
-            x = self.data[i:i+self.rnn.rnn.num_layers]
-            x = torch.tensor(x).float().unsqueeze(0).unsqueeze(2).to(self.device)
+        for i in range(0, len(self.data) - self.model.rnn.num_layers, 7):
+            x = self.data[i:i+self.model.rnn.num_layers]
+            x = torch.tensor(x).float().unsqueeze(0).unsqueeze(2).to(DEVICE)
             with torch.no_grad():
-                output = self.rnn(x)
+                output = self.model(x)
                 y_pred.append(int(output.item()))
                 mape_batch.append(torch.abs((y_true[i:i+7] - output.squeeze()) / y_true[i:i+7]) * 100)
-        y_pred = torch.tensor(y_pred).to(self.device)
+        y_pred = torch.tensor(y_pred).to(DEVICE)
         mape_batch = torch.cat(mape_batch)
     
         # Calculate MAPE for each batch
@@ -92,22 +95,15 @@ class MarkovChain:
         mape = torch.mean(mape_batch)
 
         # Print the metrics
-        print(f"MAPE: {mape.item():.2f}%")
 
         # Plot the time series
         if plot:
+            print(f"MAPE: {mape.item():.2f}%")
             y_pred_all = y_pred.repeat(7).cpu().numpy()
-            y_true_all = self.data[self.rnn.rnn.num_layers:]
+            y_true_all = self.data[self.model.rnn.num_layers:]
             plt.plot(y_true_all, label="Actual")
             plt.plot(y_pred_all, label="Predicted")
             plt.legend()
             plt.show()
                 
         return mape.item()
-    
-def train_model(data, hidden_layers, batch_size, n_epochs):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    rnn = RNN(7, hidden_layers, 1).to(device)
-    markov_chain = MarkovChain(rnn, data)
-    markov_chain.train(lr=0.001, epochs=n_epochs, batch_size=batch_size)
-    return markov_chain
